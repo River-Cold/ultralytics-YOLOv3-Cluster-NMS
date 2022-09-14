@@ -553,8 +553,12 @@ def non_max_suppression(prediction, conf_thres=0.1, iou_thres=0.6, multi_label=T
     min_wh, max_wh = 2, 4096  # (pixels) minimum and maximum box width and height
 
     method = 'cluster_weighted_diounms'
-    #method = 'merge'
-    batched = 'batch' in method  # run once per image, all classes simultaneously
+    # method = 'merge'
+    # method = 'or'
+    # method = 'vision'
+    # batched = 'batch' in method  # run once per image, all classes simultaneously
+    # batched = False
+    batched = True
     nc = prediction[0].shape[1] - 5  # number of classes
     multi_label &= nc > 1  # multiple labels per box
     output = [None] * len(prediction)

@@ -1,0 +1,4 @@
+classes= 10
+train=data/VisDrone2019-DET-train/train.txt
+valid=data/VisDrone2019-DET-val/val.txt
+names=data/visdrone.names

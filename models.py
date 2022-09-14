@@ -1,15 +1,22 @@
 from utils.google_utils import *
 from utils.layers import *
 from utils.parse_config import *
-
+from utils.quant_dorefa import QuanConv as Conv_q
+from utils.util_wqaq import Conv2d_Q
+import copy
 ONNX_EXPORT = False
 
 
-def create_modules(module_defs, img_size):
+w_bit = 8
+a_bit = 8
+
+
+
+def create_modules(module_defs, img_size, cfg):
     # Constructs module list of layer blocks from module configuration in module_defs
 
     img_size = [img_size] * 2 if isinstance(img_size, int) else img_size  # expand if necessary
-    _ = module_defs.pop(0)  # cfg training hyperparams (unused)
+    hyper = module_defs.pop(0)  # cfg training hyperparams (unused)
     output_filters = [3]  # input channels
     module_list = nn.ModuleList()
     routs = []  # list of layers which rout to deeper layers
@@ -17,8 +24,55 @@ def create_modules(module_defs, img_size):
 
     for i, mdef in enumerate(module_defs):
         modules = nn.Sequential()
+        if mdef['type'] == 'IAO_convolutional':
+            bn = int(mdef['batch_normalize'])
+            filters = int(mdef['filters'])
+            kernel_size = int(mdef['size'])
+            pad = int(mdef['pad'])
+            #first = int(mdef['first'])
+            modules.add_module('Conv2d', Conv2d_Q(in_channels=output_filters[-1],
+                                                        out_channels=filters,
+                                                        kernel_size=kernel_size,
+                                                        stride=int(mdef['stride']),
+                                                        padding=pad,
+                                                        bias=not bn,
+                                                        groups=int(mdef['group']),
+                                                        a_bits=16,
+                                                        w_bits=16,
+                                                        q_type=1,
+                                                        first_layer=0))
 
-        if mdef['type'] == 'convolutional':
+            if bn:
+                modules.add_module('BatchNorm2d',nn.BatchNorm2d(filters, momentum=0.01))
+            if mdef['activation'] == 'relu':
+                modules.add_module('activation',nn.ReLU(inplace=True))
+            elif mdef['activation'] == 'leaky':
+                modules.add_module('activation', nn.LeakyReLU(0.1, inplace=True))
+
+        elif mdef['type'] == 'quan_convolutional':
+            bn = int(mdef['batch_normalize'])
+            filters = int(mdef['filters'])
+            kernel_size = int(mdef['size'])
+            pad = int(mdef['pad'])
+            modules.add_module('Conv2d', Conv_q(in_channels=output_filters[-1],
+                                                        out_channels=filters,
+                                                        kernel_size=kernel_size,
+                                                        stride=int(mdef['stride']),
+                                                        padding=pad,
+                                                        bias=not bn,
+                                                        groups=int(mdef['group']),
+                                                        nbit_w=w_bit,
+                                                        nbit_a=a_bit
+                                                        ))
+
+            if bn:
+                modules.add_module('BatchNorm2d',nn.BatchNorm2d(filters, momentum=0.1))
+            if mdef['activation'] == 'relu':
+                modules.add_module('activation',nn.ReLU(inplace=True))
+            elif mdef['activation'] == 'leaky':
+                modules.add_module('activation', nn.LeakyReLU(0.1, inplace=True))
+                
+        elif mdef['type'] == 'convolutional':
             bn = mdef['batch_normalize']
             filters = mdef['filters']
             k = mdef['size']  # kernel size
@@ -28,8 +82,10 @@ def create_modules(module_defs, img_size):
                                                        out_channels=filters,
                                                        kernel_size=k,
                                                        stride=stride,
-                                                       padding=k // 2 if mdef['pad'] else 0,
-                                                       groups=mdef['groups'] if 'groups' in mdef else 1,
+                                                       #padding=k // 2 if mdef['pad'] else 0,
+                                                       padding=mdef['pad'],
+                                                       groups=mdef['group'] if 'group' in mdef else 1,
+                                                       #groups=mdef['group'],
                                                        bias=not bn))
             else:  # multiple-size conv
                 modules.add_module('MixConv2d', MixConv2d(in_ch=output_filters[-1],
@@ -39,7 +95,7 @@ def create_modules(module_defs, img_size):
                                                           bias=not bn))
 
             if bn:
-                modules.add_module('BatchNorm2d', nn.BatchNorm2d(filters, momentum=0.03, eps=1E-4))
+                modules.add_module('BatchNorm2d', nn.BatchNorm2d(filters, momentum=0.1, eps=1E-5))
             else:
                 routs.append(i)  # detection output (goes into yolo layer)
 
@@ -49,6 +105,8 @@ def create_modules(module_defs, img_size):
                 modules.add_module('activation', Swish())
             elif mdef['activation'] == 'mish':
                 modules.add_module('activation', Mish())
+            elif mdef['activation'] == 'relu':
+                modules.add_module('activation', nn.ReLU(inplace=True))
 
         elif mdef['type'] == 'BatchNorm2d':
             filters = output_filters[-1]
@@ -90,16 +148,21 @@ def create_modules(module_defs, img_size):
         elif mdef['type'] == 'reorg3d':  # yolov3-spp-pan-scale
             pass
 
+        elif mdef['type'] == 'se':
+            modules.add_module('se',SELayer(output_filters[-1],reduction=int(mdef['reduction'])))
+
         elif mdef['type'] == 'yolo':
             yolo_index += 1
-            stride = [32, 16, 8, 4, 2][yolo_index]  # P3-P7 stride
+            stride = [32, 16, 8]  # P5, P4, P3 strides
+            if any(x in cfg for x in ['panet', 'yolov4', 'cd53']):  # stride order reversed
+                stride = list(reversed(stride))
             layers = mdef['from'] if 'from' in mdef else []
             modules = YOLOLayer(anchors=mdef['anchors'][mdef['mask']],  # anchor list
                                 nc=mdef['classes'],  # number of classes
                                 img_size=img_size,  # (416, 416)
                                 yolo_index=yolo_index,  # 0, 1, 2...
                                 layers=layers,  # output layers
-                                stride=stride)
+                                stride=stride[yolo_index])
 
             # Initialize preceding Conv2d() bias (https://arxiv.org/pdf/1708.02002.pdf section 3.3)
             try:
@@ -219,9 +282,10 @@ class Darknet(nn.Module):
 
     def __init__(self, cfg, img_size=(416, 416), verbose=False):
         super(Darknet, self).__init__()
-
+        
         self.module_defs = parse_model_cfg(cfg)
-        self.module_list, self.routs = create_modules(self.module_defs, img_size)
+        self.hyper = copy.deepcopy(self.module_defs[0])
+        self.module_list, self.routs = create_modules(self.module_defs, img_size, cfg)
         self.yolo_layers = get_yolo_layers(self)
         # torch_utils.initialize_weights(self)
 
@@ -335,16 +399,19 @@ def get_yolo_layers(model):
     return [i for i, m in enumerate(model.module_list) if m.__class__.__name__ == 'YOLOLayer']  # [89, 101, 113]
 
 
-def load_darknet_weights(self, weights, cutoff=-1):
+def load_darknet_weights(self, weights, cutoff=0):
     # Parses and loads the weights stored in 'weights'
 
     # Establish cutoffs (load layers between 0 and cutoff. if cutoff = -1 all are loaded)
     file = Path(weights).name
+    #print(file)
     if file == 'darknet53.conv.74':
         cutoff = 75
     elif file == 'yolov3-tiny.conv.15':
         cutoff = 15
-
+    #elif file == 'best.weights':
+        #print('load coco.weights')
+        #cutoff = -1
     # Read weights file
     with open(weights, 'rb') as f:
         # Read Header https://github.com/AlexeyAB/darknet/issues/2914#issuecomment-496675346
@@ -355,6 +422,7 @@ def load_darknet_weights(self, weights, cutoff=-1):
 
     ptr = 0
     for i, (mdef, module) in enumerate(zip(self.module_defs[:cutoff], self.module_list[:cutoff])):
+        
         if mdef['type'] == 'convolutional':
             conv = module[0]
             if mdef['batch_normalize']:
@@ -382,8 +450,24 @@ def load_darknet_weights(self, weights, cutoff=-1):
             # Load conv. weights
             nw = conv.weight.numel()  # number of weights
             conv.weight.data.copy_(torch.from_numpy(weights[ptr:ptr + nw]).view_as(conv.weight))
-            ptr += nw
-
+            ptr += nb
+        
+        #elif mdef['type'] == 'se':
+            #se = module[0]
+            #fc = se.fc
+            #fc1 = fc[0]
+            #fc1_num = fc1.weight.numel()
+            #print(fc1_num)
+            #fc1_w = torch.from_numpy(weights[ptr:ptr + fc1_num]).view_as(fc1.weight)
+            #fc1.weight.data.copy_(fc1_w)
+            #ptr += fc1_num
+            #fc2 = fc[2]
+            #fc2_num = fc2.weight.numel()
+            #fc2_w = torch.from_numpy(weights[ptr:ptr + fc2_num]).view_as(fc2.weight)
+            #fc2.weight.data.copy_(fc2_w)
+            #ptr += fc2_num
+    
+    #assert ptr == len(weights)
 
 def save_weights(self, path='model.weights', cutoff=-1):
     # Converts a PyTorch model to Darket format (*.pt to *.weights)
@@ -410,6 +494,16 @@ def save_weights(self, path='model.weights', cutoff=-1):
                 # Load conv weights
                 conv_layer.weight.data.cpu().numpy().tofile(f)
 
+            elif mdef['type'] == 'se':
+                se = module[0]
+                fc = se.fc
+                fc1 = fc[0]
+                fc2 = fc[2]
+                fc1.weight.data.cpu().numpy().tofile(f)
+                fc2.weight.data.cpu().numpy().tofile(f)
+
+
+
 
 def convert(cfg='cfg/yolov3-spp.cfg', weights='weights/yolov3-spp.weights'):
     # Converts between PyTorch and Darknet format per extension (i.e. *.weights convert to *.pt and vice versa)
@@ -421,8 +515,9 @@ def convert(cfg='cfg/yolov3-spp.cfg', weights='weights/yolov3-spp.weights'):
     # Load weights and save
     if weights.endswith('.pt'):  # if PyTorch format
         model.load_state_dict(torch.load(weights, map_location='cpu')['model'])
-        save_weights(model, path='converted.weights', cutoff=-1)
-        print("Success: converted '%s' to 'converted.weights'" % weights)
+        target = weights.rsplit('.', 1)[0] + '.weights'
+        save_weights(model, path=target, cutoff=-1)
+        print("Success: converted '%s' to '%s'" % (weights, target))
 
     elif weights.endswith('.weights'):  # darknet format
         _ = load_darknet_weights(model, weights)
@@ -433,8 +528,9 @@ def convert(cfg='cfg/yolov3-spp.cfg', weights='weights/yolov3-spp.weights'):
                  'model': model.state_dict(),
                  'optimizer': None}
 
-        torch.save(chkpt, 'converted.pt')
-        print("Success: converted '%s' to 'converted.pt'" % weights)
+        target = weights.rsplit('.', 1)[0] + '.pt'
+        torch.save(chkpt, target)
+        print("Success: converted '%s' to 's%'" % (weights, target))
 
     else:
         print('Error: extension not supported.')
@@ -468,3 +564,20 @@ def attempt_download(weights):
         if not (r == 0 and os.path.exists(weights) and os.path.getsize(weights) > 1E6):  # weights exist and > 1MB
             os.system('rm ' + weights)  # remove partial downloads
             raise Exception(msg)
+
+class SELayer(nn.Module):
+    def __init__(self, channel, reduction=4):
+        super(SELayer, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+                nn.Linear(channel, channel // reduction),
+                nn.ReLU(inplace=True),
+                nn.Linear(channel // reduction, channel),
+                nn.Sigmoid())
+
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        y = torch.clamp(y, 0, 1)
+        return x * y

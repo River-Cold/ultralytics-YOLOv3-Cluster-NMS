@@ -12,19 +12,19 @@ import torch.nn.functional as F
 def init_seeds(seed=0):
     torch.manual_seed(seed)
 
-    # Remove randomness (may be slower on Tesla GPUs) # https://pytorch.org/docs/stable/notes/randomness.html
+    # Reduce randomness (may be slower on Tesla GPUs) # https://pytorch.org/docs/stable/notes/randomness.html
     if seed == 0:
-        cudnn.deterministic = True
-        cudnn.benchmark = False
+        cudnn.deterministic = False
+        cudnn.benchmark = True
 
 
 def select_device(device='', apex=False, batch_size=None):
     # device = 'cpu' or '0' or '0,1,2,3'
     cpu_request = device.lower() == 'cpu'
-    if device and not cpu_request:  # if device requested other than 'cpu'
-        os.environ['CUDA_VISIBLE_DEVICES'] = device  # set environment variable
-        assert torch.cuda.is_available(), 'CUDA unavailable, invalid device %s requested' % device  # check availablity
+    # if device and not cpu_request:  # if device requested other than 'cpu'
+        # assert torch.cuda.is_available(), 'CUDA unavailable, invalid device %s requested' % device  # check availablity
 
+    # os.environ['CUDA_VISIBLE_DEVICES'] = device  # set environment variable
     cuda = False if cpu_request else torch.cuda.is_available()
     if cuda:
         c = 1024 ** 2  # bytes to MB
